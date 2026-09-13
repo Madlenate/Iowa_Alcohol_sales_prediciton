@@ -1,0 +1,15 @@
+# Raw source CSVs (~7 GB) - keep out of git, regenerate the DB from these
+Iowa_data_set/
+
+# DuckDB database file (~1.3 GB) - rebuild with Data_Base_creation.py
+*.duckdb
+*.duckdb.wal
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Scratch query output
+*.csv
+!parquet/**/*.csv
