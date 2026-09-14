@@ -12,7 +12,7 @@ import duckdb
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_GLOB = str(PROJECT_DIR / "Iowa_data_set" / "iowa_liquor_sales_*_rows_part_*.csv")
 UNRATE_PATH = str(PROJECT_DIR / "External_datasets" / "UNRATE.csv")
-PLACES_PATH = str(PROJECT_DIR / "External_datasets" / "PLACES__Local_Data_for_Better_Health,_County_Data,_2025_release_20260912.csv")
+PLACES_PATH = str(PROJECT_DIR / "External_datasets" / "cdc_places_iowa_multi_year.csv")
 HOMELESSNESS_PATH = str(PROJECT_DIR / "External_datasets" / "iowa_homelessness_pit_2007_2025.csv")
 DB_PATH = str(PROJECT_DIR / "iowa_liquor.duckdb")
 
@@ -89,39 +89,43 @@ print(con.execute(
 print("\n-- unemployment schema --")
 print(con.execute("DESCRIBE unemployment").df())
 
-# CDC PLACES: Local Data for Better Health, county-level, 2025 release (data years 2022-2023).
-# One row per county x measure x value-type -- includes "Binge drinking among adults" and
-# "Depression among adults", directly relevant to our hypotheses. LocationID is the 5-digit
-# county FIPS code, matching sales.county_fips_code. This is a single-year snapshot, not a
-# time series, so it supports cross-county comparisons but not a growth-over-time analysis.
-# Filtered to Iowa (StateAbbr = 'IA') to keep it scoped to this project.
+# CDC PLACES: Local Data for Better Health, county-level, Iowa only, combined across the
+# 2020-2025 releases (fetched from CDC's Socrata API and reshaped -- see
+# scratchpad/fetch_places_multi_year.py). CDC changed the API schema partway through these
+# releases: 2020 and 2024 are "wide" format (no explicit survey year, so data_year is NULL
+# for those rows -- release_year is the only time signal); 2021, 2022, 2023, 2025 are "long"
+# format with an explicit data_year (the actual BRFSS survey year, which can span two years
+# within one release). Includes "Binge drinking among adults" and "Depression among adults".
+# county_fips_code is the 5-digit county FIPS code, matching sales.county_fips_code.
+# Multiple releases means this now supports a real (if uneven) trend over time, not just a
+# single-year snapshot.
 con.execute(
     """
     CREATE OR REPLACE TABLE county_health AS
     SELECT
-        try_cast(LocationID AS INTEGER) AS county_fips_code,
-        LocationName AS county_name,
-        try_cast(Year AS INTEGER) AS data_year,
-        Category AS category,
-        Measure AS measure,
-        Short_Question_Text AS short_measure,
-        Data_Value_Type AS value_type,
-        try_cast(Data_Value AS DOUBLE) AS value,
-        Data_Value_Unit AS value_unit,
-        try_cast(TotalPopulation AS BIGINT) AS total_population
+        try_cast(county_fips_code AS INTEGER) AS county_fips_code,
+        county_name,
+        try_cast(data_year AS INTEGER) AS data_year,
+        category,
+        measure,
+        short_measure,
+        value_type,
+        try_cast(value AS DOUBLE) AS value,
+        value_unit,
+        try_cast(total_population AS BIGINT) AS total_population,
+        try_cast(release_year AS INTEGER) AS release_year
     FROM read_csv(
         ?,
         header = true,
         all_varchar = true
-    )
-    WHERE StateAbbr = 'IA';
+    );
     """,
     [PLACES_PATH],
 )
 
-print("\n-- county_health: row count / counties / measures --")
+print("\n-- county_health: row count / counties / measures / releases --")
 print(con.execute(
-    "SELECT COUNT(*) AS rows, COUNT(DISTINCT county_fips_code) AS counties, COUNT(DISTINCT measure) AS measures FROM county_health"
+    "SELECT COUNT(*) AS rows, COUNT(DISTINCT county_fips_code) AS counties, COUNT(DISTINCT measure) AS measures, COUNT(DISTINCT release_year) AS releases FROM county_health"
 ).df())
 
 print("\n-- county_health schema --")
