@@ -14,6 +14,8 @@ DATA_GLOB = str(PROJECT_DIR / "Iowa_data_set" / "iowa_liquor_sales_*_rows_part_*
 UNRATE_PATH = str(PROJECT_DIR / "External_datasets" / "UNRATE.csv")
 PLACES_PATH = str(PROJECT_DIR / "External_datasets" / "cdc_places_iowa_multi_year.csv")
 HOMELESSNESS_PATH = str(PROJECT_DIR / "External_datasets" / "iowa_homelessness_pit_2007_2025.csv")
+POPULATION_PATH = str(PROJECT_DIR / "External_datasets" / "iowa_county_population_2012_2025.csv")
+POLICY_PATH = str(PROJECT_DIR / "External_datasets" / "iowa_alcohol_policy_panel_2012_2025.csv")
 DB_PATH = str(PROJECT_DIR / "iowa_liquor.duckdb")
 
 n_files = len(list((PROJECT_DIR / "Iowa_data_set").glob("iowa_liquor_sales_*_rows_part_*.csv")))
@@ -175,6 +177,75 @@ print(con.execute(
 
 print("\n-- homelessness schema --")
 print(con.execute("DESCRIBE homelessness").df())
+
+# Census Bureau county population estimates (Vintage 2019 for 2012-2019, Vintage 2025 for
+# 2020-2025 -- static files at www2.census.gov, no API key needed unlike the /pep/population
+# API endpoint). One row per county per year. county_name is uppercased with " County"
+# stripped to match sales.county_name -- see scratchpad/fetch_iowa_population.py. Covers all
+# 99 real Iowa counties; sales.county_name has a 100th value, "EL PASO", which is not an Iowa
+# county and won't match anything here (a data-quality artifact in the source sales CSVs).
+con.execute(
+    """
+    CREATE OR REPLACE TABLE county_population AS
+    SELECT
+        county_name,
+        try_cast(year AS INTEGER) AS pop_year,
+        try_cast(population AS BIGINT) AS population
+    FROM read_csv(
+        ?,
+        header = true,
+        all_varchar = true
+    );
+    """,
+    [POPULATION_PATH],
+)
+
+print("\n-- county_population: row count / counties / year range --")
+print(con.execute(
+    "SELECT COUNT(*) AS n, COUNT(DISTINCT county_name) AS counties, MIN(pop_year) AS first_year, MAX(pop_year) AS last_year FROM county_population"
+).df())
+
+print("\n-- county_population schema --")
+print(con.execute("DESCRIBE county_population").df())
+
+# Iowa alcohol regulatory panel, statewide, one row per year (2012-2025). Documents real
+# policy changes: wholesale_spirits_system shifts from "State-run" (2012-2018) to
+# "Mixed/Overlapping" (2019-2025) -- private spirits wholesale licensing became possible
+# starting 2019 (post_2019_spirits_deregulation flips to 1), with a further ABV-band
+# expansion in 2023 (post_2023_spirits_expansion flips to 1). This is a candidate root
+# cause for the store-count growth found elsewhere in this notebook, rather than just an
+# unexplained trend -- worth testing as a policy-period dummy in the regression.
+con.execute(
+    """
+    CREATE OR REPLACE TABLE alcohol_policy AS
+    SELECT
+        try_cast("Year" AS INTEGER) AS policy_year,
+        retail_beer_system,
+        retail_wine_system,
+        retail_spirits_system,
+        try_cast(wholesale_beer_staterun_threshold_abv AS DOUBLE) AS wholesale_beer_staterun_threshold_abv,
+        try_cast(wholesale_wine_staterun_threshold_abv AS DOUBLE) AS wholesale_wine_staterun_threshold_abv,
+        wholesale_spirits_system,
+        try_cast(wholesale_spirits_private_license_exists AS INTEGER) AS wholesale_spirits_private_license_exists,
+        wholesale_spirits_license_abv_band,
+        try_cast(post_2019_spirits_deregulation AS INTEGER) AS post_2019_spirits_deregulation,
+        try_cast(post_2023_spirits_expansion AS INTEGER) AS post_2023_spirits_expansion
+    FROM read_csv(
+        ?,
+        header = true,
+        all_varchar = true
+    );
+    """,
+    [POLICY_PATH],
+)
+
+print("\n-- alcohol_policy: row count / year range --")
+print(con.execute(
+    "SELECT COUNT(*) AS n, MIN(policy_year) AS first_year, MAX(policy_year) AS last_year FROM alcohol_policy"
+).df())
+
+print("\n-- alcohol_policy schema --")
+print(con.execute("DESCRIBE alcohol_policy").df())
 
 print("\n-- row count / date range --")
 print(con.execute(
