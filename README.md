@@ -3,6 +3,8 @@
 Class of Iowa wholesale liquor purchase transactions, 2012–2026, combined into a
 single queryable table (`sales`, ~36.4 million rows).
 
+Link to Website Report: https://madlenate-iowa-alcohol-sales-prediciton-app-xa9q73.streamlit.app/
+
 ## What's in the repo
 
 | Path | Description |
