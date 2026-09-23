@@ -24,9 +24,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.linear_model import Lasso, LinearRegression, LogisticRegression
+from sklearn.linear_model import Lasso, LinearRegression, LogisticRegression, Ridge
 from sklearn.metrics import classification_report, confusion_matrix, r2_score
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit, cross_val_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -180,14 +180,17 @@ def load_vendor_year(year):
 
 @st.cache_data
 def load_county_level(year):
-    return q(f"""
+    df = q(f"""
         SELECT county_name,
             SUM(sales_dollars) AS total_dollars,
+            SUM(sales_liters) AS total_liters,
             COUNT(DISTINCT store_no) AS n_stores
         FROM sales
         WHERE county_name IS NOT NULL AND county_name != 'EL PASO' AND sale_year = {int(year)}
         GROUP BY county_name
     """)
+    df["price_per_liter"] = df["total_dollars"] / df["total_liters"]
+    return df
 
 
 @st.cache_data
@@ -344,6 +347,24 @@ def load_classification():
 # ---------------------------------------------------------------------------
 
 @st.cache_data
+def state_level_diagnostics():
+    """CV R^2 and naive-baseline R^2 for the state-level Lasso model, for the metrics
+    summary table. Not cached on build_forecast_model itself since that takes a
+    DataFrame argument Streamlit can't hash reliably -- computed fresh here instead."""
+    statewide = load_statewide()
+    df, model, forecast_cols, fc_data, X_forecast = build_forecast_model(statewide)
+    y_forecast = fc_data["log_dollars_smooth_next"]
+    tscv = TimeSeriesSplit(n_splits=5)
+    model_scores, naive_scores = [], []
+    for train_idx, test_idx in tscv.split(X_forecast):
+        m = make_pipeline(StandardScaler(), Lasso(alpha=0.01, max_iter=10000))
+        m.fit(X_forecast.iloc[train_idx], y_forecast.iloc[train_idx])
+        pred = m.predict(X_forecast.iloc[test_idx])
+        model_scores.append(r2_score(y_forecast.iloc[test_idx], pred))
+        naive_scores.append(r2_score(y_forecast.iloc[test_idx], fc_data["log_dollars_smooth_lag12"].iloc[test_idx]))
+    return {"r2": np.mean(model_scores), "r2_std": np.std(model_scores), "naive_r2": np.mean(naive_scores)}
+
+
 def build_forecast_model(df):
     df = df.copy()
     month_dummies = pd.get_dummies(df["month"], prefix="month", drop_first=True)
@@ -409,6 +430,41 @@ def page_overview():
         "month to month -- store counts, pricing, unemployment, homelessness, policy changes.\n"
         "2. **Use that insight to look ahead** -- take what's associated with past ups and "
         "downs and use it to get a sense of what sales might look like going forward."
+    )
+
+    st.subheader("Why this matters")
+    st.markdown(
+        "Finding associative drivers isn't just an academic exercise -- the intent is to give a "
+        "public health agency, a community organization, or state/local government a starting list "
+        "of levers worth investigating if the goal is reducing alcohol sales and the harm that comes "
+        "with heavy drinking. If store density, pricing, or a specific policy change are genuinely "
+        "associated with higher sales, those are the kinds of things a regulator or advocacy group "
+        "could act on -- capping license density, adjusting pricing policy, or targeting outreach in "
+        "counties where the data shows the strongest associations. This dashboard doesn't make that "
+        "case on its own -- see **Scope & limitations** below, and **What Drives a Sales Dip** for "
+        "why these are associations, not proof -- but it's meant to be a starting point for that "
+        "kind of investigation, not just a sales dashboard."
+    )
+
+    st.subheader("Scope & limitations")
+    st.markdown(
+        "Worth being upfront about what this data actually is, since it directly limits what "
+        "\"forecasting alcohol sales\" can mean here. This is **wholesale purchase data** -- "
+        "records of what a *retail store* bought from its distributor (`store_no`, "
+        "`vendor_number`, `pack`, `invoice_id`) -- not point-of-sale data of what a *customer* "
+        "bought at the register. There's no customer identifier, no receipt-level basket, no time "
+        "of day, no promotion flag -- nothing that captures an actual consumer purchase decision.\n\n"
+        "That means the signal available here is almost entirely **supply-side and structural**: "
+        "how many stores are open, what things cost, how sales move with the calendar. It is not "
+        "**consumer-behavior signal** -- why any particular person bought a bottle that month. A "
+        "store's wholesale restocking can also lag or lead actual retail demand -- a spike here "
+        "might reflect stores stocking up ahead of a price or policy change rather than a genuine "
+        "surge in drinking, and there's no way to tell those apart with what's in this table.\n\n"
+        "Practically, this shapes every model in this dashboard: aggregated to the statewide level, "
+        "structural signal (store counts, pricing, seasonality) is strong enough to explain real "
+        "variance in monthly sales. Pushed down to an individual county's month-to-month movement, "
+        "that structural signal runs out -- testing that gap directly is exactly what the "
+        "county-level detail further down this section, and the Forecast section, walk through."
     )
 
     meta = load_overview_meta()
@@ -528,48 +584,80 @@ def page_investigate():
     st.pyplot(fig)
 
     st.subheader("A closer look: county-level detail")
-    st.markdown(
-        "Zooming into individual counties for the year selected above shows how concentrated Iowa's "
-        "liquor sales really are -- a handful of populous counties account for a large share of the "
-        "statewide total, tracking store count (and population) far more than anything else."
+
+    county_view = st.radio(
+        "View", ["Sales ($)", "Price per liter ($)"], horizontal=True, label_visibility="collapsed"
     )
 
     county_year = load_county_level(year)
-    top_counties = county_year.nlargest(15, "total_dollars").sort_values("total_dollars")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6))
-    sales_millions = top_counties["total_dollars"] / 1_000_000
-    ax1.barh(top_counties["county_name"], sales_millions, color=PALETTE["blue"])
-    ax1.set_title(f"Top 15 counties by sales -- {year}")
-    ax1.set_xlabel("sales ($ millions)")
-    ax2.barh(top_counties["county_name"], top_counties["n_stores"], color=PALETTE["red"])
-    ax2.set_title(f"Store count, same counties -- {year}")
-    ax2.set_xlabel("unique stores")
-    fig.tight_layout()
-    st.pyplot(fig)
+    if county_view == "Sales ($)":
+        st.markdown(
+            "Zooming into individual counties for the year selected above shows how concentrated Iowa's "
+            "liquor sales really are -- a handful of populous counties account for a large share of the "
+            "statewide total, tracking store count (and population) far more than anything else."
+        )
 
-    st.subheader("Could county-level detail improve the forecast?")
-    st.markdown(
-        "One idea we tested directly: instead of forecasting from a single statewide number "
-        "(168 monthly rows, 2012-2025), train on a county-month panel instead -- roughly 15,000 "
-        "rows, since each of Iowa's ~99 counties gets its own row every month. More rows should mean "
-        "more material for a model to learn from.\n\n"
-        "**It didn't hold up.** The headline cross-validated R² for the county-panel model looked "
-        "great at first glance (0.987) -- but a baseline that isn't even a model (just guessing each "
-        "county's value from the same month one year earlier, no fitting at all) already scored "
-        "0.970. Almost all of that 0.987 was really just \"Polk County is always huge and a rural "
-        "county is always tiny,\" which any predictor nails instantly once county sizes span two "
-        "orders of magnitude. Once we isolated the actual question -- can this predict whether a "
-        "*given* county moves up or down relative to its own normal level -- the real (\"within-"
-        "county\") R² came back **negative** (roughly -1.3), meaning it did worse than simply "
-        "assuming each county keeps doing what it usually does.\n\n"
-        "The takeaway: summing all 100 counties into one statewide series isn't just \"less data\" "
-        "-- it's a form of noise reduction. A county with a handful of stores can swing wildly for "
-        "reasons that have nothing to do with the broader trend; aggregating averages that "
-        "idiosyncratic noise out. More rows looked like an obvious win going in, and it's worth "
-        "remembering it wasn't one here -- the statewide model in the Forecast section remains the "
-        "more defensible choice."
-    )
+        top_counties = county_year.nlargest(15, "total_dollars").sort_values("total_dollars")
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6))
+        sales_millions = top_counties["total_dollars"] / 1_000_000
+        ax1.barh(top_counties["county_name"], sales_millions, color=PALETTE["blue"])
+        ax1.set_title(f"Top 15 counties by sales -- {year}")
+        ax1.set_xlabel("sales ($ millions)")
+        ax2.barh(top_counties["county_name"], top_counties["n_stores"], color=PALETTE["red"])
+        ax2.set_title(f"Store count, same counties -- {year}")
+        ax2.set_xlabel("unique stores")
+        fig.tight_layout()
+        st.pyplot(fig)
+
+        st.subheader("Could county-level detail improve the forecast?")
+        st.markdown(
+            "One idea we tested directly: instead of forecasting from a single statewide number "
+            "(168 monthly rows, 2012-2025), train on a county-month panel instead -- roughly 15,000 "
+            "rows, since each of Iowa's ~99 counties gets its own row every month. More rows should mean "
+            "more material for a model to learn from.\n\n"
+            "**It didn't hold up.** The headline cross-validated R² for the county-panel model looked "
+            "great at first glance (0.987) -- but a baseline that isn't even a model (just guessing each "
+            "county's value from the same month one year earlier, no fitting at all) already scored "
+            "0.970. Almost all of that 0.987 was really just \"Polk County is always huge and a rural "
+            "county is always tiny,\" which any predictor nails instantly once county sizes span two "
+            "orders of magnitude. Once we isolated the actual question -- can this predict whether a "
+            "*given* county moves up or down relative to its own normal level -- the real (\"within-"
+            "county\") R² came back **negative** (roughly -1.3), meaning it did worse than"
+            "assuming each county keeps on just staying small and having small sales.\n\n"
+        )
+
+    else:  # Price per liter ($)
+        top_counties = county_year.nlargest(15, "total_dollars").sort_values("total_dollars")
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6))
+        ax1.barh(top_counties["county_name"], top_counties["price_per_liter"], color=PALETTE["green"])
+        ax1.set_title(f"Price per liter, same counties -- {year}")
+        ax1.set_xlabel("price per liter ($)")
+        ax2.barh(top_counties["county_name"], top_counties["n_stores"], color=PALETTE["red"])
+        ax2.set_title(f"Store count, same counties -- {year}")
+        ax2.set_xlabel("unique stores")
+        fig.tight_layout()
+        st.pyplot(fig)
+
+        st.subheader("Why look at price per liter?")
+        st.markdown(
+            "`total_dollars` scales almost entirely with county size -- Polk moves ~800x the dollars "
+            "of the smallest county, simply because it has ~800x the population and stores. That size "
+            "gap dominates any model trained on raw totals, drowning out whatever genuine month-to-"
+            "month signal exists underneath it.\n\n"
+            "`price_per_liter` (`total_dollars / total_liters`) is different: it's a *rate*, not a "
+            "*total*, so it doesn't automatically scale with county size the way raw dollars do -- a "
+            "bottle of vodka costs roughly the same in Polk as it does in a small rural county. Our "
+            "methodology going into this: if we can normalize away the county-size effect at the "
+            "source, by predicting a rate instead of a total, a county-panel model might get a fairer "
+            "shot at learning genuine temporal patterns instead of just re-deriving each county's size "
+            "for free.\n\n"
+            "We tested this directly, the same way we tested the raw-dollar version -- results (what "
+            "held up and what didn't) are written up in the **Forecast** section rather than here, "
+            "since it's a forecasting question and that's where it belongs."
+        )
 
 
 def page_pca():
@@ -740,15 +828,304 @@ we intended to carry into the forecasting step next.
     )
 
 
+@st.cache_data
+def load_county_panel():
+    panel = q("""
+        SELECT county_name, sale_year, EXTRACT(month FROM ordered_on) AS month,
+            SUM(sales_dollars) AS total_dollars,
+            SUM(sales_bottles) AS total_bottles,
+            SUM(sales_liters) AS total_liters,
+            COUNT(DISTINCT store_no) AS n_stores
+        FROM sales
+        WHERE county_name IS NOT NULL AND county_name != 'EL PASO' AND sale_year < 2026
+        GROUP BY 1, 2, 3
+    """)
+    panel["avg_price_per_bottle"] = panel["total_dollars"] / panel["total_bottles"]
+    panel["price_per_liter"] = panel["total_dollars"] / panel["total_liters"]
+    panel["log_dollars"] = np.log1p(panel["total_dollars"])
+    return panel.sort_values(["county_name", "sale_year", "month"]).reset_index(drop=True)
+
+
+def _cv_diagnostics(X_all, y_all, fc_panel, naive_col):
+    """Pooled CV R^2, a trivial same-county-last-year naive baseline, and within-county
+    (demeaned) R^2 -- the three numbers needed to tell real skill apart from the
+    between-county size effect. See the Investigate page for the full explanation."""
+    periods = fc_panel[["sale_year", "month"]].drop_duplicates().sort_values(["sale_year", "month"]).reset_index(drop=True)
+    tscv = TimeSeriesSplit(n_splits=5)
+    period_key = list(zip(fc_panel["sale_year"], fc_panel["month"]))
+    model_scores, naive_scores, within_scores = [], [], []
+    for train_p_idx, test_p_idx in tscv.split(periods):
+        train_periods = set(map(tuple, periods.iloc[train_p_idx][["sale_year", "month"]].values))
+        test_periods = set(map(tuple, periods.iloc[test_p_idx][["sale_year", "month"]].values))
+        train_mask = np.array([k in train_periods for k in period_key])
+        test_mask = np.array([k in test_periods for k in period_key])
+
+        cv_model = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        cv_model.fit(X_all[train_mask], y_all[train_mask])
+        pred = cv_model.predict(X_all[test_mask])
+        model_scores.append(r2_score(y_all[test_mask], pred))
+        naive_scores.append(r2_score(y_all[test_mask], fc_panel.loc[test_mask, naive_col]))
+
+        county_means = y_all[train_mask].groupby(fc_panel.loc[train_mask, "county_name"]).mean()
+        overall_mean = y_all[train_mask].mean()
+        y_train_dm = y_all[train_mask] - fc_panel.loc[train_mask, "county_name"].map(county_means)
+        y_test_dm = y_all[test_mask] - fc_panel.loc[test_mask, "county_name"].map(county_means).fillna(overall_mean)
+        cv_model2 = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        cv_model2.fit(X_all[train_mask], y_train_dm)
+        pred_dm = cv_model2.predict(X_all[test_mask])
+        within_scores.append(r2_score(y_test_dm, pred_dm))
+
+    return {
+        "pooled_r2": np.mean(model_scores), "pooled_r2_std": np.std(model_scores),
+        "naive_r2": np.mean(naive_scores),
+        "within_r2": np.mean(within_scores), "within_r2_std": np.std(within_scores),
+    }
+
+
+@st.cache_data
+def build_county_dollar_forecast():
+    """County-month panel forecast of total_dollars, summed to a statewide total.
+    Mirrors the notebook's county-panel forecasting experiment."""
+    panel = load_county_panel().copy()
+    month_dummies = pd.get_dummies(panel["month"], prefix="month", drop_first=True)
+    baseline_cols = ["n_stores", "avg_price_per_bottle"]
+    baseline_data = pd.concat([panel[baseline_cols + ["log_dollars"]], month_dummies], axis=1).dropna()
+    X_base = baseline_data[baseline_cols + list(month_dummies.columns)]
+    y_base = baseline_data["log_dollars"]
+    baseline_model = LinearRegression().fit(X_base, y_base)
+    panel.loc[baseline_data.index, "residual"] = y_base - baseline_model.predict(X_base)
+
+    g = panel.groupby("county_name")
+    panel["log_dollars_smooth"] = g["log_dollars"].transform(lambda s: s.rolling(3).mean())
+    panel["log_dollars_smooth_next"] = g["log_dollars_smooth"].shift(-1)
+    panel["log_dollars_smooth_lag12"] = g["log_dollars_smooth"].shift(11)
+    panel["residual_lag1"] = g["residual"].shift(1)
+    panel["n_stores_lag1"] = g["n_stores"].shift(1)
+    panel["price_lag1"] = g["avg_price_per_bottle"].shift(1)
+
+    forecast_cols = ["log_dollars_smooth_lag12", "residual_lag1", "n_stores_lag1", "price_lag1"]
+    fc_panel = panel[["county_name", "sale_year", "month"] + forecast_cols + ["log_dollars_smooth_next"]].dropna()
+
+    X_all = fc_panel[forecast_cols]
+    y_all = fc_panel["log_dollars_smooth_next"]
+    final_model = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+    final_model.fit(X_all, y_all)
+
+    lookup = panel.set_index(["county_name", "sale_year", "month"])
+    last_rows = panel.sort_values(["county_name", "sale_year", "month"]).groupby("county_name").tail(1)
+
+    horizons = 3
+    rows = []
+    for _, last in last_rows.iterrows():
+        county = last["county_name"]
+        last_year, last_month = int(last["sale_year"]), int(last["month"])
+        for h in range(1, horizons + 1):
+            target_month = 1 if (last_month + h - 1) % 12 == 0 else (last_month + h - 1) % 12 + 1
+            target_year = last_year + (last_month + h - 1) // 12
+            anchor_key = (county, target_year - 1, target_month)
+            if anchor_key not in lookup.index or pd.isna(lookup.loc[anchor_key, "log_dollars_smooth"]):
+                continue
+            step_X = pd.DataFrame([{
+                "log_dollars_smooth_lag12": lookup.loc[anchor_key, "log_dollars_smooth"],
+                "residual_lag1": last["residual"],
+                "n_stores_lag1": last["n_stores"],
+                "price_lag1": last["avg_price_per_bottle"],
+            }])[forecast_cols]
+            pred_log = final_model.predict(step_X)[0]
+            rows.append((county, target_year, target_month, h, np.expm1(pred_log)))
+
+    county_forecasts = pd.DataFrame(rows, columns=["county_name", "sale_year", "month", "h", "forecast_dollars"])
+    statewide_forecast = county_forecasts.groupby(["sale_year", "month"])["forecast_dollars"].sum().reset_index()
+    statewide_forecast["date"] = pd.to_datetime(dict(year=statewide_forecast["sale_year"], month=statewide_forecast["month"], day=1))
+
+    actual_statewide = panel.groupby(["sale_year", "month"])["total_dollars"].sum().reset_index()
+    actual_statewide["date"] = pd.to_datetime(dict(year=actual_statewide["sale_year"], month=actual_statewide["month"], day=1))
+
+    diagnostics = _cv_diagnostics(X_all, y_all, fc_panel, "log_dollars_smooth_lag12")
+    return actual_statewide, statewide_forecast, diagnostics
+
+
+@st.cache_data
+def build_county_price_forecast():
+    """County-month panel forecast of price_per_liter, averaged to a statewide figure
+    (a rate, so averaged rather than summed -- unlike the dollar version above)."""
+    panel = load_county_panel().copy()
+    g = panel.groupby("county_name")
+    panel["price_smooth"] = g["price_per_liter"].transform(lambda s: s.rolling(3).mean())
+    panel["price_smooth_next"] = g["price_smooth"].shift(-1)
+    panel["price_smooth_lag12"] = g["price_smooth"].shift(11)
+    panel["price_lag1"] = g["price_per_liter"].shift(1)
+    panel["n_stores_lag1"] = g["n_stores"].shift(1)
+
+    forecast_cols = ["price_smooth_lag12", "price_lag1", "n_stores_lag1"]
+    fc_panel = panel[["county_name", "sale_year", "month"] + forecast_cols + ["price_smooth_next"]].dropna()
+
+    X_all = fc_panel[forecast_cols]
+    y_all = fc_panel["price_smooth_next"]
+    final_model = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+    final_model.fit(X_all, y_all)
+
+    lookup = panel.set_index(["county_name", "sale_year", "month"])
+    last_rows = panel.sort_values(["county_name", "sale_year", "month"]).groupby("county_name").tail(1)
+
+    horizons = 3
+    rows = []
+    for _, last in last_rows.iterrows():
+        county = last["county_name"]
+        last_year, last_month = int(last["sale_year"]), int(last["month"])
+        for h in range(1, horizons + 1):
+            target_month = 1 if (last_month + h - 1) % 12 == 0 else (last_month + h - 1) % 12 + 1
+            target_year = last_year + (last_month + h - 1) // 12
+            anchor_key = (county, target_year - 1, target_month)
+            if anchor_key not in lookup.index or pd.isna(lookup.loc[anchor_key, "price_smooth"]):
+                continue
+            step_X = pd.DataFrame([{
+                "price_smooth_lag12": lookup.loc[anchor_key, "price_smooth"],
+                "price_lag1": last["price_per_liter"],
+                "n_stores_lag1": last["n_stores"],
+            }])[forecast_cols]
+            pred_price = final_model.predict(step_X)[0]
+            rows.append((county, target_year, target_month, h, pred_price))
+
+    county_forecasts = pd.DataFrame(rows, columns=["county_name", "sale_year", "month", "h", "forecast_price_per_liter"])
+    statewide_forecast = county_forecasts.groupby(["sale_year", "month"])["forecast_price_per_liter"].mean().reset_index()
+    statewide_forecast["date"] = pd.to_datetime(dict(year=statewide_forecast["sale_year"], month=statewide_forecast["month"], day=1))
+
+    actual_statewide = panel.groupby(["sale_year", "month"])["price_per_liter"].mean().reset_index()
+    actual_statewide["date"] = pd.to_datetime(dict(year=actual_statewide["sale_year"], month=actual_statewide["month"], day=1))
+
+    diagnostics = _cv_diagnostics(X_all, y_all, fc_panel, "price_smooth_lag12")
+    return actual_statewide, statewide_forecast, diagnostics
+
+
 def page_forecast():
     st.header("Forecast")
     st.info(
-        "\U0001F6A7 **Under revision.** The forecasting approach (Lasso on a 3-month-smoothed "
-        "target, using last year's level plus recent store/price/momentum signals) is being "
-        "reworked, so this section is intentionally left blank for now.\n\n"
-        "The lag-alignment bug that broke the previous version's seasonal anchor is already "
-        "fixed in `build_forecast_model` / `multi_month_forecast` in app.py -- they're just not "
-        "wired into this page yet."
+        "The original single-series state-level approach (Lasso on a 3-month-smoothed target) "
+        "has a fixed lag-alignment bug but isn't wired up below -- what's shown instead is the "
+        "county-panel experiment from the Investigate page, taken all the way through to an "
+        "actual forward forecast, with the same honest diagnostics attached."
+    )
+
+    st.subheader("County-panel forecast: sales ($)")
+    actual_d, forecast_d, diag_d = build_county_dollar_forecast()
+    last_point_d = actual_d.iloc[[-1]][["date", "total_dollars"]].rename(columns={"total_dollars": "forecast_dollars"})
+    connected_d = pd.concat([last_point_d, forecast_d[["date", "forecast_dollars"]]], ignore_index=True)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(actual_d["date"].tail(36), actual_d["total_dollars"].tail(36) / 1_000_000,
+            label="actual statewide sales", color=PALETTE["blue"])
+    ax.plot(connected_d["date"], connected_d["forecast_dollars"] / 1_000_000,
+            label="county-panel forecast (summed)", color=PALETTE["green"], marker="o", linestyle="--")
+    ax.set_ylabel("sales ($ millions)")
+    ax.set_xlabel("date")
+    ax.legend(loc="upper left")
+    st.pyplot(fig)
+
+    st.caption(
+        f"Pooled CV R² = {diag_d['pooled_r2']:.3f} (± {diag_d['pooled_r2_std']:.3f}) vs. a naive "
+        f"\"same county, last year\" guess (no model at all) at R² = {diag_d['naive_r2']:.3f} -- almost "
+        f"all of the pooled score is just county size, not real skill. Within-county R² = "
+        f"{diag_d['within_r2']:.2f} (± {diag_d['within_r2_std']:.2f}) -- negative, meaning this doesn't "
+        f"reliably predict any individual county's ups and downs. Full breakdown on the "
+        f"**Investigate & Understand the Data** page."
+    )
+
+    st.subheader("County-panel forecast: price per liter ($)")
+    actual_p, forecast_p, diag_p = build_county_price_forecast()
+    last_point_p = actual_p.iloc[[-1]][["date", "price_per_liter"]].rename(columns={"price_per_liter": "forecast_price_per_liter"})
+    connected_p = pd.concat([last_point_p, forecast_p[["date", "forecast_price_per_liter"]]], ignore_index=True)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(actual_p["date"].tail(36), actual_p["price_per_liter"].tail(36),
+            label="actual statewide price per liter", color=PALETTE["blue"])
+    ax.plot(connected_p["date"], connected_p["forecast_price_per_liter"],
+            label="county-panel forecast (averaged)", color=PALETTE["green"], marker="o", linestyle="--")
+    ax.set_ylabel("price per liter ($)")
+    ax.set_xlabel("date")
+    ax.legend(loc="upper left")
+    st.pyplot(fig)
+
+    st.caption(
+        f"Pooled CV R² = {diag_p['pooled_r2']:.3f} vs. naive R² = {diag_p['naive_r2']:.3f} -- a real "
+        f"gap this time, unlike the dollar version above. Within-county R² = {diag_p['within_r2']:.2f} "
+        f"(± {diag_p['within_r2_std']:.2f}) -- still negative, so normalizing by volume helped the "
+        f"pooled comparison but still didn't produce reliable per-county forecasting skill."
+    )
+
+    st.subheader("Metrics summary")
+    st.markdown(
+        "Every model built across this dashboard, side by side. \"Naive\" is a same-"
+        "period-last-year guess with no model at all -- the bar a model has to clear to be "
+        "doing real work, not just restating structure that was already obvious."
+    )
+
+    sl = state_level_diagnostics()
+    forecast_rows = pd.DataFrame([
+        {
+            "Model": "State-level Lasso (statewide monthly)",
+            "Rows": "168",
+            "CV R²": f"{sl['r2']:.3f} ± {sl['r2_std']:.3f}",
+            "Naive R²": f"{sl['naive_r2']:.3f}",
+            "Within-entity R²": "n/a (single series)",
+            "Verdict": "Real skill -- best of the three",
+        },
+        {
+            "Model": "County-panel, sales ($)",
+            "Rows": "~15,200",
+            "CV R²": f"{diag_d['pooled_r2']:.3f} ± {diag_d['pooled_r2_std']:.3f}",
+            "Naive R²": f"{diag_d['naive_r2']:.3f}",
+            "Within-entity R²": f"{diag_d['within_r2']:.2f} ± {diag_d['within_r2_std']:.2f}",
+            "Verdict": "Misleading -- mostly county size, not skill",
+        },
+        {
+            "Model": "County-panel, price per liter ($)",
+            "Rows": "~15,200",
+            "CV R²": f"{diag_p['pooled_r2']:.3f} ± {diag_p['pooled_r2_std']:.3f}",
+            "Naive R²": f"{diag_p['naive_r2']:.3f}",
+            "Within-entity R²": f"{diag_p['within_r2']:.2f} ± {diag_p['within_r2_std']:.2f}",
+            "Verdict": "Real gap vs. naive, but no per-county skill",
+        },
+    ])
+    st.dataframe(forecast_rows, use_container_width=True, hide_index=True)
+
+    st.subheader("Steps moving forward")
+    st.caption(
+        "A deliberate change of lens from the rest of this dashboard: the Overview page frames the "
+        "goal as helping a public health body *lower* sales. This closing section instead asks the "
+        "opposite, business-facing question -- what does the data suggest about *growing* sales -- "
+        "as a contrast, not the app's overall stance."
+    )
+    st.markdown(
+        "Reading the associative findings from a retail/revenue angle instead of a harm-reduction "
+        "one:\n\n"
+        "- **Store access moved the needle historically.** `n_stores` was one of the strongest "
+        "features in every model on this dashboard, and the 2023 licensing overhaul (which made it "
+        "easier to open/operate a retail license) coincided with the state's largest sales growth "
+        "in the dataset. Easier licensing is the single most consistent lever we found.\n"
+        "- **Lean into the existing seasonal pattern rather than fight it.** Every year in this "
+        "dataset shows the same September-November run-up and a post-holiday drop-off -- inventory, "
+        "staffing, and promotions timed to that window would be working with the grain of actual "
+        "demand instead of against it.\n"
+        "- **The county-panel results above are a real limitation here, not just for harm reduction.** "
+        "Negative within-county R² means this data doesn't tell us *which* counties or *which* "
+        "months are about to move -- only that store count, price, and season matter in aggregate. "
+        "Any county-targeted growth strategy built on this data alone would be guessing past what "
+        "the model can actually support.\n"
+        "- **Price's effect is genuinely unclear.** It shows up as a real driver in several models here, "
+        "but with an inconsistent sign across them -- not a reliable enough signal to base a pricing "
+        "strategy on without dedicated experimentation (e.g. an actual price test), which this "
+        "wholesale data can't substitute for.\n"
+        "- **The clearest next step is better data, not a better model.** Every limitation above "
+        "traces back to the same root cause laid out in **Scope & limitations**: this is wholesale "
+        "distributor data, not point-of-sale data -- it shows what a *store* bought, not what a "
+        "*customer* bought. The county-panel experiment already tested whether simply adding more "
+        "rows of this same kind of data would help, and it didn't (within-county R² stayed "
+        "negative even with ~15,000 rows). What's actually missing is *local, purchase-level* "
+        "signal -- register/POS sales, foot traffic, local promotions, or hyper-local economic "
+        "indicators -- data that reflects real consumer purchasing behavior rather than a store's "
+        "restocking schedule. Without that, any forecast built on this dataset alone -- to grow "
+        "sales or shrink them -- is working from a proxy, not the real signal."
     )
 
 
