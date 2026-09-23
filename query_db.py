@@ -21,16 +21,22 @@ import duckdb
 PROJECT_DIR = Path(__file__).resolve().parent
 DB_PATH = PROJECT_DIR / "iowa_liquor.duckdb"
 PARQUET_GLOB = str(PROJECT_DIR / "parquet" / "by_year" / "**" / "*.parquet")
+AUXILIARY_DIR = PROJECT_DIR / "parquet" / "auxiliary"
+AUXILIARY_TABLES = ["unemployment", "homelessness", "county_population", "alcohol_policy"]
 
 _con = None
 
 
 def connect(read_only=True):
-    """Return a cached connection exposing the `sales` table.
+    """Return a cached connection exposing `sales` plus the small auxiliary tables
+    (unemployment, homelessness, county_population, alcohol_policy).
 
-    Uses iowa_liquor.duckdb if it exists; otherwise (e.g. a fresh git clone)
-    falls back to an in-memory connection with `sales` as a view over the
-    Parquet files in parquet/by_year/.
+    Uses iowa_liquor.duckdb if it exists; otherwise (e.g. a fresh git clone, or a
+    deployment like Streamlit Community Cloud that only has the git repo) falls
+    back to an in-memory connection with each table as a view over its Parquet
+    file(s) -- `sales` over parquet/by_year/, the small tables over their single
+    files in parquet/auxiliary/. Any auxiliary table whose Parquet file is missing
+    is silently skipped (not every deployment needs every table).
     """
     global _con
     if _con is None:
@@ -43,6 +49,11 @@ def connect(read_only=True):
                 f"CREATE VIEW sales AS "
                 f"SELECT * FROM read_parquet('{path}', hive_partitioning = true)"
             )
+            for table in AUXILIARY_TABLES:
+                parquet_path = AUXILIARY_DIR / f"{table}.parquet"
+                if parquet_path.exists():
+                    safe_path = str(parquet_path).replace("\\", "/").replace("'", "''")
+                    _con.execute(f"CREATE VIEW {table} AS SELECT * FROM read_parquet('{safe_path}')")
         else:
             raise SystemExit(
                 "No data found. Expected iowa_liquor.duckdb (run Data_Base_creation.py) "
