@@ -179,6 +179,18 @@ def load_vendor_year(year):
 
 
 @st.cache_data
+def load_county_level(year):
+    return q(f"""
+        SELECT county_name,
+            SUM(sales_dollars) AS total_dollars,
+            COUNT(DISTINCT store_no) AS n_stores
+        FROM sales
+        WHERE county_name IS NOT NULL AND county_name != 'EL PASO' AND sale_year = {int(year)}
+        GROUP BY county_name
+    """)
+
+
+@st.cache_data
 def load_pca_features():
     """County-month feature table used for PCA. Mirrors notebook cells 18-20."""
     cat_df = q("""
@@ -436,6 +448,12 @@ def page_overview():
 
 def page_investigate():
     st.header("Investigate & Understand the Data")
+    st.markdown(
+        "This section explores the raw data before any modeling happens: sales trends by vendor "
+        "and month, how sales compare against unemployment, homelessness, and population over time, "
+        "and a closer look at what changes when you break the same numbers down to the county level "
+        "instead of one statewide total."
+    )
 
     statewide = load_statewide()
     years = sorted(statewide["sale_year"].unique())
@@ -508,6 +526,50 @@ def page_investigate():
     ax.set_ylabel(f"index (100 = {plot_df['date'].iloc[0]:%b %Y})")
     ax.legend(loc="upper left", fontsize=8)
     st.pyplot(fig)
+
+    st.subheader("A closer look: county-level detail")
+    st.markdown(
+        "Zooming into individual counties for the year selected above shows how concentrated Iowa's "
+        "liquor sales really are -- a handful of populous counties account for a large share of the "
+        "statewide total, tracking store count (and population) far more than anything else."
+    )
+
+    county_year = load_county_level(year)
+    top_counties = county_year.nlargest(15, "total_dollars").sort_values("total_dollars")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6))
+    sales_millions = top_counties["total_dollars"] / 1_000_000
+    ax1.barh(top_counties["county_name"], sales_millions, color=PALETTE["blue"])
+    ax1.set_title(f"Top 15 counties by sales -- {year}")
+    ax1.set_xlabel("sales ($ millions)")
+    ax2.barh(top_counties["county_name"], top_counties["n_stores"], color=PALETTE["red"])
+    ax2.set_title(f"Store count, same counties -- {year}")
+    ax2.set_xlabel("unique stores")
+    fig.tight_layout()
+    st.pyplot(fig)
+
+    st.subheader("Could county-level detail improve the forecast?")
+    st.markdown(
+        "One idea we tested directly: instead of forecasting from a single statewide number "
+        "(168 monthly rows, 2012-2025), train on a county-month panel instead -- roughly 15,000 "
+        "rows, since each of Iowa's ~99 counties gets its own row every month. More rows should mean "
+        "more material for a model to learn from.\n\n"
+        "**It didn't hold up.** The headline cross-validated R² for the county-panel model looked "
+        "great at first glance (0.987) -- but a baseline that isn't even a model (just guessing each "
+        "county's value from the same month one year earlier, no fitting at all) already scored "
+        "0.970. Almost all of that 0.987 was really just \"Polk County is always huge and a rural "
+        "county is always tiny,\" which any predictor nails instantly once county sizes span two "
+        "orders of magnitude. Once we isolated the actual question -- can this predict whether a "
+        "*given* county moves up or down relative to its own normal level -- the real (\"within-"
+        "county\") R² came back **negative** (roughly -1.3), meaning it did worse than simply "
+        "assuming each county keeps doing what it usually does.\n\n"
+        "The takeaway: summing all 100 counties into one statewide series isn't just \"less data\" "
+        "-- it's a form of noise reduction. A county with a handful of stores can swing wildly for "
+        "reasons that have nothing to do with the broader trend; aggregating averages that "
+        "idiosyncratic noise out. More rows looked like an obvious win going in, and it's worth "
+        "remembering it wasn't one here -- the statewide model in the Forecast section remains the "
+        "more defensible choice."
+    )
 
 
 def page_pca():
